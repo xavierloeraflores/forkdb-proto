@@ -20,6 +20,26 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --locked
       - run: cargo build --release --locked
+      - name: Exercise the Linux release binary
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          project="$work/project %20 # ' quote"
+          mkdir "$project"
+          unset DATABASE_URL
+          dbfork() { "$GITHUB_WORKSPACE/target/release/dbfork-proto" -C "$project" --json "$@"; }
+          dbfork init
+          dbfork create feat/linux
+          dbfork status --check
+          dbfork create feat/child --from feat/linux
+          dbfork status --check
+          dbfork list
+          dbfork switch main
+          dbfork delete feat/child --yes
+          dbfork delete feat/linux --yes
+          dbfork status --check
   databases:
     runs-on: ubuntu-latest
     steps:
