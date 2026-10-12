@@ -17,10 +17,26 @@ pub struct Worktree {
     pub branch: Option<String>,
 }
 
+/// Git for Windows cannot use the verbatim paths returned by canonicalize for
+/// every command (notably `worktree add`). Keep those paths for filesystem I/O.
+pub fn git_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let value = path.to_string_lossy();
+        if let Some(unc) = value.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{}", unc).into();
+        }
+        if let Some(local) = value.strip_prefix(r"\\?\") {
+            return local.into();
+        }
+    }
+    path.to_owned()
+}
+
 fn git(dir: &Path, args: &[&str]) -> Result<Output> {
     Command::new("git")
         .arg("-C")
-        .arg(dir)
+        .arg(git_path(dir))
         .args(args)
         .output()
         .context("could not run git")
@@ -73,7 +89,7 @@ pub fn discover(dir: &Path) -> Result<Context> {
     };
     let output = match Command::new("git")
         .arg("-C")
-        .arg(dir)
+        .arg(git_path(dir))
         .args(["rev-parse", "--show-toplevel"])
         .output()
     {
@@ -456,6 +472,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn shell_paths_strip_windows_verbatim_prefixes() {
+        assert_eq!(
+            git_path(Path::new(r"\\?\C:\directory\repo")),
+            Path::new(r"C:\directory\repo")
+        );
+        assert_eq!(
+            git_path(Path::new(r"\\?\UNC\server\share\repo")),
+            Path::new(r"\\server\share\repo")
+        );
         assert_eq!(
             shell_quote(Path::new(r"\\?\C:\directory\binary.exe")).unwrap(),
             "'C:/directory/binary.exe'"

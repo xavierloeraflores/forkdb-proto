@@ -37,8 +37,8 @@ fn failure(root: &Path, args: &[&str]) -> Output {
 fn git(root: &Path, args: &[&str]) {
     let output = Command::new("git")
         .arg("-C")
-        .arg(root)
-        .args(args)
+        .arg(dbfork_git::git_path(root))
+        .args(args.iter().map(|arg| dbfork_git::git_path(Path::new(arg))))
         .output()
         .unwrap();
     assert!(

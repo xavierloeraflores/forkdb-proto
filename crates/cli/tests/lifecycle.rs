@@ -213,8 +213,8 @@ fn multiple_databases_update_every_configured_env_file() {
 fn git(root: &Path, args: &[&str]) {
     let o = Command::new("git")
         .arg("-C")
-        .arg(root)
-        .args(args)
+        .arg(dbfork_git::git_path(root))
+        .args(args.iter().map(|arg| dbfork_git::git_path(Path::new(arg))))
         .output()
         .unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
