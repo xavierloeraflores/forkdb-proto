@@ -152,6 +152,119 @@ pub fn branches(root: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
+const HOOK_MARKER: &str = "#!/bin/sh\n# dbfork-proto managed post-checkout hook v1\n";
+const BACKUP_NAME: &str = ".dbfork-proto-post-checkout.original";
+
+fn hook_path(root: &Path) -> Result<PathBuf> {
+    if discover(root)?.common_dir.is_none() {
+        bail!("automatic hooks require a Git repository");
+    }
+    // Git applies core.hooksPath here, including paths relative to the worktree.
+    path(one_line(successful(git(
+        root,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "hooks/post-checkout",
+        ],
+    )?)?))
+}
+
+fn shell_quote(value: &Path) -> Result<String> {
+    let value = value
+        .to_str()
+        .context("hook executable path must be UTF-8")?;
+    #[cfg(windows)]
+    let value = value.replace('\\', "/");
+    Ok(format!("'{}'", value.replace('\'', "'\"'\"'")))
+}
+
+fn hook_contents(path: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            Ok(Some(std::fs::read(path)?))
+        }
+        Ok(_) => bail!("refusing non-regular hook file {}", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Install a wrapper that runs the previous hook and synchronizes the current
+/// worktree after branch checkouts. Database failures never fail the checkout.
+pub fn install_hooks(root: &Path, executable: &Path) -> Result<()> {
+    use std::io::Write;
+    let executable = executable
+        .canonicalize()
+        .context("hook executable does not exist")?;
+    if !executable.is_file() {
+        bail!("hook executable must be a regular file");
+    }
+    let hook = hook_path(root)?;
+    let directory = hook.parent().context("hook path has no parent")?;
+    std::fs::create_dir_all(directory)?;
+    if std::fs::symlink_metadata(directory)?
+        .file_type()
+        .is_symlink()
+    {
+        bail!("refusing symlink hooks directory");
+    }
+    let backup = directory.join(BACKUP_NAME);
+    let existing = hook_contents(&hook)?;
+    let managed = existing
+        .as_ref()
+        .is_some_and(|bytes| bytes.starts_with(HOOK_MARKER.as_bytes()));
+    let previous = hook_contents(&backup)?;
+    if !managed && previous.is_some() {
+        bail!("hook backup already exists; restore or remove it before installing");
+    }
+    let script = format!("{HOOK_MARKER}\nprevious_status=0\nif [ -x {backup} ]; then\n  {backup} \"$@\" || previous_status=$?\nfi\n# Git passes 1 for a branch checkout and 0 for a file checkout.\nif [ \"${{3:-0}}\" = 1 ]; then\n  if ! {executable} sync --yes >/dev/null; then\n    printf '%s\\n' 'dbfork-proto: database sync failed; run dbfork-proto sync to retry.' >&2\n  fi\nfi\nexit \"$previous_status\"\n", backup=shell_quote(&backup)?, executable=shell_quote(&executable)?);
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    temporary.write_all(script.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o755))?;
+    }
+    temporary.as_file().sync_all()?;
+    let moved = !managed && existing.is_some();
+    if moved {
+        std::fs::rename(&hook, &backup)?;
+    }
+    if let Err(error) = temporary.persist(&hook) {
+        if moved {
+            std::fs::rename(&backup, &hook)
+                .context("hook install failed and original hook could not be restored")?;
+        }
+        return Err(error.error.into());
+    }
+    Ok(())
+}
+
+/// Remove only our managed wrapper and restore any original hook exactly.
+pub fn uninstall_hooks(root: &Path) -> Result<()> {
+    let hook = hook_path(root)?;
+    let Some(contents) = hook_contents(&hook)? else {
+        return Ok(());
+    };
+    if !contents.starts_with(HOOK_MARKER.as_bytes()) {
+        bail!("post-checkout is not managed by dbfork-proto; leaving it unchanged");
+    }
+    let backup = hook
+        .parent()
+        .context("hook path has no parent")?
+        .join(BACKUP_NAME);
+    if hook_contents(&backup)?.is_some() {
+        std::fs::rename(backup, hook)?;
+    } else {
+        std::fs::remove_file(hook)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +330,74 @@ mod tests {
             .unwrap()
             .iter()
             .any(|tree| tree.path == linked.canonicalize().unwrap() && tree.branch.is_none()));
+    }
+
+    #[test]
+    fn hooks_preserve_existing_and_respect_custom_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        run(tmp.path(), &["init", "-b", "main"]);
+        run(tmp.path(), &["config", "core.hooksPath", "custom hooks"]);
+        let directory = tmp.path().join("custom hooks");
+        std::fs::create_dir(&directory).unwrap();
+        let hook = directory.join("post-checkout");
+        let original = b"#!/bin/sh\n# original hook\nexit 0\n";
+        std::fs::write(&hook, original).unwrap();
+        let executable = tmp.path().join("a binary with ' quote");
+        std::fs::write(&executable, "#!/bin/sh\nexit 1\n").unwrap();
+        install_hooks(tmp.path(), &executable).unwrap();
+        let first = std::fs::read(&hook).unwrap();
+        install_hooks(tmp.path(), &executable).unwrap();
+        assert_eq!(std::fs::read(&hook).unwrap(), first);
+        assert_eq!(
+            std::fs::read(directory.join(BACKUP_NAME)).unwrap(),
+            original
+        );
+        assert!(String::from_utf8(first).unwrap().contains("sync --yes"));
+        uninstall_hooks(tmp.path()).unwrap();
+        assert_eq!(std::fs::read(&hook).unwrap(), original);
+        assert!(!directory.join(BACKUP_NAME).exists());
+        assert!(uninstall_hooks(tmp.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_failure_does_not_fail_checkout_and_preserves_original_hook_status() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        run(tmp.path(), &["init", "-b", "main"]);
+        let executable = tmp.path().join("binary ' name");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > invoked\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        install_hooks(tmp.path(), &executable).unwrap();
+        let hook = hook_path(tmp.path()).unwrap();
+        let result = Command::new(&hook)
+            .current_dir(tmp.path())
+            .args(["old", "new", "1"])
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("database sync failed"));
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("invoked")).unwrap(),
+            "sync --yes\n"
+        );
+        uninstall_hooks(tmp.path()).unwrap();
+        uninstall_hooks(tmp.path()).unwrap();
+        std::fs::write(&hook, "#!/bin/sh\nexit 7\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        install_hooks(tmp.path(), &executable).unwrap();
+        assert_eq!(
+            Command::new(hook)
+                .current_dir(tmp.path())
+                .args(["old", "new", "1"])
+                .status()
+                .unwrap()
+                .code(),
+            Some(7)
+        );
     }
 }

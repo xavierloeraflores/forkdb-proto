@@ -1,0 +1,24 @@
+[package]
+name = "dbfork-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Isolated database environments for Git branches and worktrees"
+
+[[bin]]
+name = "dbfork-proto"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+tokio.workspace = true
+serde_json.workspace = true
+dbfork-core.workspace = true
+dbfork-model.workspace = true
+dbfork-providers.workspace = true
+dbfork-git.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }

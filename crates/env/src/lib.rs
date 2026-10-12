@@ -14,7 +14,7 @@ pub fn read(path: &Path) -> Result<BTreeMap<String, String>> {
     };
     dotenvy::from_read_iter(text.as_bytes())
         .collect::<std::result::Result<_, _>>()
-        .with_context(|| format!("invalid environment file {}", path.display()))
+        .map_err(|_| anyhow::anyhow!("invalid environment file {}", path.display()))
 }
 
 fn read_text(path: &Path) -> Result<Option<String>> {
@@ -119,6 +119,11 @@ fn records(text: &str) -> Vec<(&str, Option<&str>, Option<&str>)> {
 }
 
 fn quote(value: &str) -> String {
+    // Single quotes keep literal dollar signs and backslashes compatible with
+    // dotenv readers that do not implement shell-style double-quote escapes.
+    if !value.contains(['\'', '\n', '\r']) {
+        return format!("'{value}'");
+    }
     let mut output = String::from("\"");
     for ch in value.chars() {
         match ch {
@@ -146,7 +151,7 @@ pub fn update(path: &Path, values: &BTreeMap<String, String>) -> Result<()> {
     // Validate before editing, so malformed multiline records cannot hide keys.
     let _: BTreeMap<String, String> = dotenvy::from_read_iter(original.as_bytes())
         .collect::<std::result::Result<_, _>>()
-        .context("cannot update malformed environment file")?;
+        .map_err(|_| anyhow::anyhow!("cannot update malformed environment file"))?;
     let newline = if original.contains("\r\n") {
         "\r\n"
     } else {
@@ -343,10 +348,19 @@ mod tests {
         let path = temp.path().join(".env");
         fs::write(&path, "URL=\"one\ntwo\"\nOTHER=value").unwrap();
         update(&path, &BTreeMap::from([("URL".into(), "new".into())])).unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "URL='new'\nOTHER=value");
+    }
+    #[test]
+    fn literal_dollar_and_backslash_use_single_quotes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(".env");
+        let value = "postgres://test:pa$ss\\word@localhost/db#fragment";
+        update(&path, &BTreeMap::from([("URL".into(), value.into())])).unwrap();
         assert_eq!(
-            fs::read_to_string(path).unwrap(),
-            "URL=\"new\"\nOTHER=value"
+            fs::read_to_string(&path).unwrap(),
+            format!("URL='{value}'\n")
         );
+        assert_eq!(read(&path).unwrap()["URL"], value);
     }
     #[test]
     fn manual_ignore_is_idempotent() {

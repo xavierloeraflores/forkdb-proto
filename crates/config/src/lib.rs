@@ -99,5 +99,5 @@ impl Drop for Lock { fn drop(&mut self) { let _=FileExt::unlock(&self.0); } }
         let mut c:Config=toml::from_str("[project]\nname='test'\n[[databases]]\nname='db'\nengine='sqlite'\nprovider='local'\nconnection_env='DATABASE_URL'\n").unwrap();
         assert!(c.validate().is_ok()); c.project.env_files=vec!["../.env".into()]; assert!(c.validate().is_err());
     }
-    #[test] fn writes_and_replaces_atomically() { let d=tempfile::tempdir().unwrap();let p=d.path().join("state");private_write(&p,b"one").unwrap();private_write(&p,b"two").unwrap();assert_eq!(fs::read(p).unwrap(),b"two"); }
+    #[test] fn writes_and_replaces_atomically() { let d=tempfile::tempdir().unwrap();let p=d.path().canonicalize().unwrap().join("state");private_write(&p,b"one").unwrap();private_write(&p,b"two").unwrap();assert_eq!(fs::read(p).unwrap(),b"two"); }
 }
