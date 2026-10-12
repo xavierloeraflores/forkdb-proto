@@ -1,0 +1,13 @@
+[package]
+name = "dbfork-env"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tempfile.workspace = true
+dotenvy = "0.15"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
