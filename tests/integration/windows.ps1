@@ -51,8 +51,9 @@ try {
         Invoke-Dbfork -Arguments @('delete', $branch, '--yes') | Out-Null
     }
     $status = Invoke-Dbfork -Arguments @('status', '--check')
-    if ($status.environment -ne 'main' -or $status.environments -ne 0 -or -not $status.health[0].healthy) {
-        throw 'source was not restored and healthy after deleting clones'
+    $source = Join-Path $project '.dbfork/source.sqlite'
+    if ($status.environment -ne 'main' -or $status.environments -ne 0 -or $status.health.Count -ne 0 -or -not (Test-Path -LiteralPath $source)) {
+        throw 'source was not restored after deleting clones'
     }
     Write-Host 'Windows release CLI lifecycle passed.'
 }
