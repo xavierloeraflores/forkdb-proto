@@ -18,6 +18,7 @@ dbfork-providers.workspace = true
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 url.workspace = true
+percent-encoding = "2"
 
 [dev-dependencies]
 tempfile.workspace = true

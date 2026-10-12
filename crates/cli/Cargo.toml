@@ -20,5 +20,6 @@ dbfork-providers.workspace = true
 dbfork-git.workspace = true
 
 [dev-dependencies]
+dbfork-engines.workspace = true
 tempfile.workspace = true
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }

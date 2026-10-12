@@ -47,7 +47,7 @@ fn pg_command(program: &str, url: &str) -> Result<Command> {
     }
     Ok(c)
 }
-fn mysql_options(url: &str) -> Result<tempfile::NamedTempFile> {
+fn mysql_options(url: &str, mariadb: bool) -> Result<tempfile::NamedTempFile> {
     let u = parse_url(url)?;
     let decode = |s: &str| {
         percent_encoding::percent_decode_str(s)
@@ -70,12 +70,27 @@ fn mysql_options(url: &str) -> Result<tempfile::NamedTempFile> {
     if u.query_pairs()
         .any(|(k, v)| k == "ssl-mode" && v != "DISABLED")
     {
-        writeln!(f, "ssl-mode=VERIFY_IDENTITY")?;
+        if mariadb {
+            writeln!(f, "ssl=true\nssl-verify-server-cert=true")?;
+        } else {
+            writeln!(f, "ssl-mode=VERIFY_IDENTITY")?;
+        }
     }
     Ok(f)
 }
 pub(crate) async fn create(request: &CloneRequest) -> Result<Resource> {
     seed_files(request)?;
+    let flavor = request
+        .config
+        .options
+        .get("mysql_flavor")
+        .map(String::as_str)
+        .unwrap_or("mysql");
+    ensure!(
+        matches!(flavor, "mysql" | "mariadb"),
+        "mysql_flavor must be mysql or mariadb"
+    );
+    let mariadb = flavor == "mariadb";
     let target = destination(request)?;
     let source = parse_url(&request.source.connection_url)?;
     let source_name = database_name(&source)?;
@@ -123,14 +138,14 @@ pub(crate) async fn create(request: &CloneRequest) -> Result<Resource> {
                 restore.args(["--no-owner", "--no-privileges", "--exit-on-error"]).arg(dump.path());
                 run(&mut restore, "pg_restore").await?;
             } else {
-                let source_options = mysql_options(source.as_str())?;
-                let mut dump_cmd = Command::new(request.config.options.get("mysql_dump_command").map(String::as_str).unwrap_or("mysqldump"));
+                let source_options = mysql_options(source.as_str(), mariadb)?;
+                let mut dump_cmd = Command::new(request.config.options.get("mysql_dump_command").map(String::as_str).unwrap_or(if mariadb {"mariadb-dump"} else {"mysqldump"}));
                 dump_cmd.arg(format!("--defaults-extra-file={}", source_options.path().display())).args(["--single-transaction", "--skip-lock-tables", "--routines", "--triggers", "--events", "--no-tablespaces"]);
                 if request.strategy != Strategy::Full { dump_cmd.arg("--no-data"); }
-                dump_cmd.arg(&source_name).stdin(Stdio::null()).stdout(fs::File::create(dump.path())?);
+                dump_cmd.arg(&source_name).stdin(Stdio::null());
                 run_to_file(&mut dump_cmd, "mysqldump", fs::File::create(dump.path())?).await?;
-                let target_options = mysql_options(target.as_str())?;
-                let mut restore = Command::new(request.config.options.get("mysql_command").map(String::as_str).unwrap_or("mysql"));
+                let target_options = mysql_options(target.as_str(), mariadb)?;
+                let mut restore = Command::new(request.config.options.get("mysql_command").map(String::as_str).unwrap_or(if mariadb {"mariadb"} else {"mysql"}));
                 restore.arg(format!("--defaults-extra-file={}", target_options.path().display())).arg(&r.id).stdin(fs::File::open(dump.path())?);
                 run(&mut restore, "mysql restore").await?;
             }

@@ -41,6 +41,17 @@ pub async fn create(request: &CloneRequest) -> Result<Resource> {
     ensure_local_daemon().await?;
     ensure!(recover(request).await?.is_none(), "a Docker container already exists for this provisioning intent; recover it before retrying");
     let (default_image, inner_port, scheme) = engine_settings(request.config.engine)?;
+    let default_image = if request.config.engine == Engine::Mysql
+        && request
+            .config
+            .options
+            .get("mysql_flavor")
+            .is_some_and(|flavor| flavor == "mariadb")
+    {
+        "mariadb:11.4"
+    } else {
+        default_image
+    };
     let mode = match request
         .config
         .options
@@ -293,7 +304,7 @@ async fn ensure_local_daemon() -> Result<()> {
 async fn wait_ready(container: &str, engine: Engine) -> Result<()> {
     let health = match engine {
         Engine::Postgres => "pg_isready -h 127.0.0.1 -U postgres -d postgres",
-        Engine::Mysql => "MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" mysql --protocol=tcp -h 127.0.0.1 -u root -Nse 'SELECT 1'",
+        Engine::Mysql => "client=$(command -v mysql || command -v mariadb) && MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" \"$client\" --protocol=tcp -h 127.0.0.1 -u root -Nse 'SELECT 1'",
         Engine::Mongodb => "mongosh --quiet --host 127.0.0.1 --eval 'if(!db.getSiblingDB(\"admin\").auth(process.env.MONGO_INITDB_ROOT_USERNAME,process.env.MONGO_INITDB_ROOT_PASSWORD)){quit(1)}; if(!db.adminCommand({ping:1}).ok){quit(1)}'",
         Engine::Redis => "REDISCLI_AUTH=\"$DBFORK_PASSWORD\" redis-cli ping | grep -q PONG",
         Engine::Sqlite => unreachable!(),

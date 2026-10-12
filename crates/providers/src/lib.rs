@@ -35,7 +35,7 @@ pub fn capabilities(provider: &str) -> Result<Capabilities> {
         "planetscale" => (vec![Mysql, Postgres], logical, "Logical cloning only when CREATE DATABASE and dump/restore permissions are available, including a separately provisioned target_server_url. Vitess plans may prohibit CREATE DATABASE. Native branches are not implemented."),
         "mongodb-atlas" | "atlas" => (vec![Mongodb], logical, "Logical MongoDB dump/restore requires database creation and restore privileges. Indexes and collection options are preserved; cluster settings and users are not cloned."),
         "upstash" => (vec![Redis], logical, "Requires a separately provisioned writable Redis target_server_url and target_db=0; Upstash does not support multiple logical database indexes. Native provisioning is not implemented."),
-        _ => bail!("unknown provider '{provider}'; run providers to see supported providers"),
+        _ => bail!("unknown provider '{provider}'; see the README for provider names"),
     };
     Ok(Capabilities {
         provider: provider.into(),

@@ -88,11 +88,15 @@ pub fn discover(dir: &Path) -> Result<Context> {
         successful(output)?;
         unreachable!()
     }
-    let root = path(one_line(output.stdout))?;
+    let root = path(one_line(output.stdout))?
+        .canonicalize()
+        .context("Git worktree root is inaccessible")?;
     let common_dir = path(one_line(successful(git(
         dir,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )?)?))?;
+    )?)?))?
+    .canonicalize()
+    .context("Git common directory is inaccessible")?;
     let branch_output = git(dir, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
     let branch = if branch_output.status.success() {
         Some(
@@ -124,10 +128,18 @@ pub fn worktrees(root: &Path) -> Result<Vec<Worktree>> {
             if let Some(tree) = current.take() {
                 result.push(tree);
             }
-            current = Some(Worktree {
-                path: path(value.to_vec())?,
-                branch: None,
-            });
+            let location = path(value.to_vec())?;
+            match location.canonicalize() {
+                Ok(location) => {
+                    current = Some(Worktree {
+                        path: location,
+                        branch: None,
+                    })
+                }
+                // Git can retain prunable records for worktrees removed outside Git.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => current = None,
+                Err(error) => return Err(error).context("Git worktree path is inaccessible"),
+            }
         } else if let Some(value) = field.strip_prefix(b"branch refs/heads/") {
             if let Some(tree) = current.as_mut() {
                 tree.branch =
@@ -222,7 +234,14 @@ fn shell_quote(value: &Path) -> Result<String> {
         .to_str()
         .context("hook executable path must be UTF-8")?;
     #[cfg(windows)]
-    let value = value.replace('\\', "/");
+    let value = if let Some(unc) = value.strip_prefix(r"\\?\UNC\") {
+        format!("//{}", unc.replace('\\', "/"))
+    } else {
+        value
+            .strip_prefix(r"\\?\")
+            .unwrap_or(value)
+            .replace('\\', "/")
+    };
     Ok(format!("'{}'", value.replace('\'', "'\"'\"'")))
 }
 
@@ -430,6 +449,21 @@ mod tests {
             .unwrap()
             .iter()
             .any(|tree| tree.path == linked.canonicalize().unwrap() && tree.branch.is_none()));
+        std::fs::remove_dir_all(&linked).unwrap();
+        assert_eq!(worktrees(&root).unwrap().len(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_paths_strip_windows_verbatim_prefixes() {
+        assert_eq!(
+            shell_quote(Path::new(r"\\?\C:\directory\binary.exe")).unwrap(),
+            "'C:/directory/binary.exe'"
+        );
+        assert_eq!(
+            shell_quote(Path::new(r"\\?\UNC\server\share\binary.exe")).unwrap(),
+            "'//server/share/binary.exe'"
+        );
     }
 
     #[test]

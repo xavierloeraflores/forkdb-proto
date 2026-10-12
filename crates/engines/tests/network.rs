@@ -101,8 +101,11 @@ async fn postgres_full_schema_seed_and_rollback() -> Result<()> {
 async fn mysql_full_schema_seed_and_rollback() -> Result<()> {
     let root = tempfile::tempdir()?;
     let mut req = request(Engine::Mysql, "DBFORK_TEST_MYSQL", root.path());
+    if let Ok(flavor) = std::env::var("DBFORK_TEST_MYSQL_FLAVOR") {
+        req.config.options.insert("mysql_flavor".into(), flavor);
+    }
     let mut source = sqlx::MySqlConnection::connect(&req.source.connection_url).await?;
-    sqlx::raw_sql("DROP TABLE IF EXISTS engine_fixture; CREATE TABLE engine_fixture (id INTEGER PRIMARY KEY, note TEXT); INSERT INTO engine_fixture VALUES (1, 'source')").execute(&mut source).await?;
+    sqlx::raw_sql("DROP VIEW IF EXISTS engine_names; DROP TABLE IF EXISTS engine_fixture; CREATE TABLE engine_fixture (id INTEGER PRIMARY KEY, note TEXT); INSERT INTO engine_fixture VALUES (1, 'source'); CREATE VIEW engine_names AS SELECT note FROM engine_fixture").execute(&mut source).await?;
     for strategy in [Strategy::Full, Strategy::SchemaOnly, Strategy::Seeded] {
         req.strategy = strategy;
         std::fs::write(
@@ -128,6 +131,14 @@ async fn mysql_full_schema_seed_and_rollback() -> Result<()> {
         target
             .execute("INSERT INTO engine_fixture VALUES (3, 'clone')")
             .await?;
+        let view_count: i64 = sqlx::query_scalar("SELECT count(*) FROM engine_names")
+            .fetch_one(&mut target)
+            .await?;
+        assert_eq!(
+            view_count,
+            count + 1,
+            "cloned view must read the cloned table"
+        );
         target.close().await?;
         delete(&r).await?;
         delete(&r).await?;

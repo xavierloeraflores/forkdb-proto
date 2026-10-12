@@ -96,11 +96,12 @@ fn moved_worktree_still_protects_its_active_database_from_deletion() {
     success(&old, &["create", "feat/moved"]);
     let state_path = root.join(".git/dbfork-proto/state.json");
     let state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
-    let database = state["environments"]["feat/moved"]["resources"][0]["connection_url"]
-        .as_str()
-        .unwrap()
-        .strip_prefix("sqlite://")
-        .unwrap();
+    let database = dbfork_engines::sqlite_path(
+        state["environments"]["feat/moved"]["resources"][0]["connection_url"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
     git(
         &root,
         &[
@@ -111,10 +112,10 @@ fn moved_worktree_still_protects_its_active_database_from_deletion() {
         ],
     );
     failure(&root, &["delete", "feat/moved", "--yes"]);
-    assert!(Path::new(database).exists());
+    assert!(database.exists());
     success(&moved, &["switch", "main"]);
     success(&root, &["delete", "feat/moved", "--yes"]);
-    assert!(!Path::new(database).exists());
+    assert!(!database.exists());
 }
 
 #[test]

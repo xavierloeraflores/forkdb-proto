@@ -146,7 +146,7 @@ async fn postgres_instance_clone_isolated_and_cleanup() -> Result<()> {
 async fn smoke(engine: Engine, env: &str, image: &str) -> Result<()> {
     let source = std::env::var(env).with_context(|| format!("set {env} to a disposable source"))?;
     let dir = tempfile::tempdir()?;
-    let request = CloneRequest {
+    let mut request = CloneRequest {
         config: DatabaseConfig {
             name: "docker-smoke".into(),
             engine,
@@ -171,10 +171,60 @@ async fn smoke(engine: Engine, env: &str, image: &str) -> Result<()> {
         project_dir: dir.path().into(),
         strategy: Strategy::Instance,
     };
-    let resource = dbfork_providers::create(&request).await?;
-    let health = dbfork_providers::validate(&resource).await;
-    dbfork_providers::delete(&resource).await?;
-    health
+    if image.starts_with("mariadb:") {
+        request
+            .config
+            .options
+            .insert("mysql_flavor".into(), "mariadb".into());
+    }
+    let mut mysql_source = if engine == Engine::Mysql {
+        Some(sqlx::MySqlConnection::connect(&request.source.connection_url).await?)
+    } else {
+        None
+    };
+    let table = format!("provider_{}", uuid::Uuid::new_v4().simple());
+    if let Some(source) = &mut mysql_source {
+        sqlx::raw_sql(&format!(
+            "CREATE TABLE {table}(id INTEGER PRIMARY KEY); INSERT INTO {table} VALUES(1)"
+        ))
+        .execute(source)
+        .await?;
+    }
+    let created = dbfork_providers::create(&request).await;
+    let result = match created {
+        Ok(resource) => {
+            let verified = async {
+                dbfork_providers::validate(&resource).await?;
+                if let Some(source) = &mut mysql_source {
+                    let mut target =
+                        sqlx::MySqlConnection::connect(&resource.connection_url).await?;
+                    let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                        .fetch_one(&mut target)
+                        .await?;
+                    anyhow::ensure!(count == 1, "instance clone did not copy source data");
+                    sqlx::query(&format!("INSERT INTO {table} VALUES(2)"))
+                        .execute(&mut target)
+                        .await?;
+                    let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                        .fetch_one(source)
+                        .await?;
+                    anyhow::ensure!(count == 1, "instance writes modified source data");
+                    target.close().await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            dbfork_providers::delete(&resource).await?;
+            verified
+        }
+        Err(error) => Err(error),
+    };
+    if let Some(source) = &mut mysql_source {
+        sqlx::query(&format!("DROP TABLE {table}"))
+            .execute(source)
+            .await?;
+    }
+    result
 }
 
 #[tokio::test]
@@ -187,6 +237,12 @@ async fn mongodb_instance() -> Result<()> {
 #[ignore = "requires Docker, MySQL tools and disposable DBFORK_TEST_MYSQL"]
 async fn mysql_instance() -> Result<()> {
     smoke(Engine::Mysql, "DBFORK_TEST_MYSQL", "mysql:8.4").await
+}
+
+#[tokio::test]
+#[ignore = "requires Docker, MariaDB tools and disposable DBFORK_TEST_MARIADB"]
+async fn mariadb_instance() -> Result<()> {
+    smoke(Engine::Mysql, "DBFORK_TEST_MARIADB", "mariadb:11.4").await
 }
 
 #[tokio::test]

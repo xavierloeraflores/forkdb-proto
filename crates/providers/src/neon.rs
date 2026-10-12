@@ -500,12 +500,16 @@ pub async fn delete(resource: &Resource) -> Result<()> {
 }
 
 pub async fn validate(resource: &Resource) -> Result<()> {
-    let (project, id, name) = identity(resource)?;
     let key_env = resource
         .metadata
         .get("neon_api_key_env")
         .context("missing Neon API key environment variable name")?;
     let api = Neon::from_env(key_env)?;
+    validate_with_api(resource, &api).await
+}
+
+async fn validate_with_api(resource: &Resource, api: &Neon) -> Result<()> {
+    let (project, id, name) = identity(resource)?;
     let response = api
         .branch(project, id)
         .await?
@@ -523,6 +527,129 @@ pub async fn validate(resource: &Resource) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL in DBFORK_TEST_POSTGRES_URL"]
+    async fn native_create_validate_delete_with_real_postgres() -> Result<()> {
+        use dbfork_model::{DatabaseConfig, Strategy};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let database_url = std::env::var("DBFORK_TEST_POSTGRES_URL")
+            .context("set DBFORK_TEST_POSTGRES_URL to a disposable PostgreSQL connection")?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let child_uri = database_url.clone();
+        let server = tokio::spawn(async move {
+            for step in 0..9 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(split) = bytes.windows(4).position(|s| s == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&bytes[..split]).to_lowercase();
+                        let length = header
+                            .lines()
+                            .find_map(|s| s.strip_prefix("content-length: "))
+                            .map(|s| s.parse::<usize>().unwrap())
+                            .unwrap_or(0);
+                        if bytes.len() >= split + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let request = String::from_utf8(bytes).unwrap();
+                assert!(request.contains("authorization: Bearer test-key"));
+                assert!(!request.starts_with("DELETE /projects/project-test/branches/br-parent"));
+                let response = match step {
+                    0 => {
+                        assert!(request.starts_with("GET /projects/project-test/branches?search=dbfork-dbf_positive&limit=100"));
+                        json!({"branches":[]})
+                    },
+                    1 => {
+                        assert!(request.starts_with("GET /projects/project-test/connection_uri?branch_id=br-parent&"));
+                        json!({"uri":"postgres://user:secret@ep-parent.example/app"})
+                    },
+                    2 => {
+                        assert!(request.starts_with("POST /projects/project-test/branches "));
+                        let body:Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                        assert_eq!(body.pointer("/branch/parent_id").unwrap(), "br-parent");
+                        assert_eq!(body.pointer("/branch/name").unwrap(), "dbfork-dbf_positive");
+                        assert_eq!(body.pointer("/endpoints/0/type").unwrap(), "read_write");
+                        json!({"branch":{"id":"br-child"},"operations":[{"id":"op-create"}]})
+                    },
+                    3 => {
+                        assert!(request.starts_with("GET /projects/project-test/operations/op-create "));
+                        json!({"operation":{"status":"finished"}})
+                    },
+                    4 => {
+                        assert!(request.starts_with("GET /projects/project-test/connection_uri?branch_id=br-child&"));
+                        json!({"uri":child_uri})
+                    },
+                    5 | 6 => {
+                        assert!(request.starts_with("GET /projects/project-test/branches/br-child "));
+                        json!({"branch":{"id":"br-child","name":"dbfork-dbf_positive","parent_id":"br-parent","default":false,"protected":false}})
+                    },
+                    7 => {
+                        assert!(request.starts_with("DELETE /projects/project-test/branches/br-child "));
+                        json!({"operations":[{"id":"op-delete"}]})
+                    },
+                    8 => {
+                        assert!(request.starts_with("GET /projects/project-test/operations/op-delete "));
+                        json!({"operation":{"status":"finished"}})
+                    },
+                    _ => unreachable!(),
+                }.to_string();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",response.len(),response).as_bytes()).await.unwrap();
+            }
+        });
+        let request = CloneRequest {
+            config: DatabaseConfig {
+                name: "primary".into(),
+                engine: Engine::Postgres,
+                provider: "neon".into(),
+                connection_env: "DATABASE_URL".into(),
+                source_env: None,
+                strategy: Strategy::Native,
+                seed: vec![],
+                options: BTreeMap::from([
+                    ("project_id".into(), "project-test".into()),
+                    ("parent_branch_id".into(), "br-parent".into()),
+                ]),
+            },
+            source: Resource {
+                database: "primary".into(),
+                engine: Engine::Postgres,
+                provider: "neon".into(),
+                id: "source".into(),
+                connection_url: "postgres://user:secret@ep-parent.example/app".into(),
+                strategy: Strategy::Native,
+                metadata: BTreeMap::new(),
+            },
+            target_id: "dbf_positive".into(),
+            data_dir: ".".into(),
+            project_dir: ".".into(),
+            strategy: Strategy::Native,
+        };
+        let api = Neon {
+            client: Client::new(),
+            base: format!("http://{address}"),
+            key: "test-key".into(),
+        };
+        let resource = create_with_api(&request, &api).await?;
+        assert_eq!(resource.id, request.target_id);
+        assert_eq!(resource.connection_url, database_url);
+        assert_eq!(
+            resource.metadata.get("neon_parent_id").unwrap(),
+            "br-parent"
+        );
+        assert_eq!(resource.metadata.get("neon_branch_id").unwrap(), "br-child");
+        validate_with_api(&resource, &api).await?;
+        api.delete_owned(&resource).await?;
+        tokio::time::timeout(Duration::from_secs(10), server).await??;
+        Ok(())
+    }
     #[test]
     fn parent_matching_supports_pooled_connections() {
         assert!(same_database(

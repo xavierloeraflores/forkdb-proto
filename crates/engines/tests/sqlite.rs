@@ -23,7 +23,7 @@ fn request(root: &std::path::Path, strategy: Strategy) -> CloneRequest {
             engine: Engine::Sqlite,
             provider: "local".into(),
             id: "source".into(),
-            connection_url: format!("sqlite://{}", source.display()),
+            connection_url: dbfork_engines::sqlite_url(&source).unwrap(),
             strategy: Strategy::Full,
             metadata: BTreeMap::new(),
         },
@@ -34,7 +34,7 @@ fn request(root: &std::path::Path, strategy: Strategy) -> CloneRequest {
     }
 }
 fn db(r: &Resource) -> Connection {
-    Connection::open(r.connection_url.strip_prefix("sqlite://").unwrap()).unwrap()
+    Connection::open(dbfork_engines::sqlite_path(&r.connection_url).unwrap()).unwrap()
 }
 fn count(db: &Connection, table: &str) -> i64 {
     db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
@@ -60,9 +60,9 @@ async fn full_clone_includes_uncheckpointed_wal_and_is_independent() {
     drop(target);
     delete(&result).await.unwrap();
     assert_eq!(count(&source, "users"), 2);
-    assert!(
-        !std::path::Path::new(result.connection_url.strip_prefix("sqlite://").unwrap()).exists()
-    );
+    assert!(!dbfork_engines::sqlite_path(&result.connection_url)
+        .unwrap()
+        .exists());
 }
 #[tokio::test]
 async fn schema_preserves_indexes_views_and_triggers_without_rows() {
@@ -193,5 +193,24 @@ async fn recover_interrupted_backup_requires_directory_ownership_and_cleans_part
     let r = create(&req).await.unwrap();
     validate(&r).await.unwrap();
     delete(&r).await.unwrap();
+    assert_eq!(count(&db(&req.source), "users"), 1);
+}
+
+#[tokio::test]
+async fn sqlite_urls_round_trip_literal_percent_hash_and_spaces() {
+    let root = tempfile::tempdir().unwrap();
+    let special = root.path().join("literal%25 #directory");
+    std::fs::create_dir(&special).unwrap();
+    let req = request(&special, Strategy::Full);
+    let result = create(&req).await.unwrap();
+    assert!(result.connection_url.contains("%2525%20%23directory"));
+    assert_eq!(count(&db(&result), "users"), 1);
+    validate(&result).await.unwrap();
+    let recovered = dbfork_engines::recover(&req).await.unwrap().unwrap();
+    delete(&recovered).await.unwrap();
+    assert_eq!(
+        dbfork_engines::sqlite_path("literal%25 #directory").unwrap(),
+        std::path::PathBuf::from("literal%25 #directory")
+    );
     assert_eq!(count(&db(&req.source), "users"), 1);
 }
