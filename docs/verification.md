@@ -1,6 +1,6 @@
 # Prototype verification
 
-Verified locally on October 11, 2026. Commands and fixtures are in the repository so these checks can be repeated.
+Verification began on October 11, 2026. Commands and fixtures are in the repository so these checks can be repeated.
 
 | Requirement | Implementation and evidence |
 | --- | --- |
@@ -33,10 +33,11 @@ Verified locally on October 11, 2026. Commands and fixtures are in the repositor
 - The positive Neon API lifecycle test passed against local HTTP fixtures and a disposable PostgreSQL 17 endpoint, including real connection validation and child-only deletion.
 - Strict workspace Clippy passed with warnings denied.
 - The optimized release binary completed init/create/status/switch/delete in a path containing literal `%20`, spaces and `#`.
+- The GitHub Actions portable matrix passed on Linux x64/ARM64, macOS x64/ARM64, and Windows x64 at commit `7fe9be3`. Its Windows job used Rust 1.99 MSVC and passed formatting, strict Clippy, 46 portable tests, and the release build. The Windows release CLI lifecycle is also exercised by `tests/integration/windows.ps1` in the CI workflow.
 
 ## Verification limits
 
-The CI matrix includes macOS x64, Windows x64 and Linux x64, but those remote jobs have not been run from this local session. Linux ARM64 and macOS ARM64 ran locally.
+The connected Windows x64 host has Rust 1.99 and a native GNU linker, but Windows Smart App Control blocks execution of unsigned Cargo build scripts there. The hosted Windows CI runner provides executable verification; this host did not run the CLI. Linux ARM64 and macOS ARM64 also ran locally.
 
 Live cloud accounts were not used. Neon contract tests use local HTTP fixtures; the other cloud providers route to engine adapters and require service-specific database privileges. The implementation does not provision managed AWS, Google Cloud, Azure or other paid instances. Unsupported native branching and snapshots return explicit errors.
 

@@ -9,6 +9,8 @@ cargo test --workspace --locked
 cargo build --release --locked
 ```
 
+On Windows, `pwsh tests/integration/windows.ps1` exercises the release `.exe` in a disposable SQLite project after the release build. It covers full, parent, schema-only and seeded creation, activation, status, listing, deletion, and a path with spaces and special characters. The CI Windows job runs it automatically.
+
 The CLI integration suites run real subprocesses against disposable SQLite databases and Git repositories. They cover source protection, parent selection, schema-only and seeded clones, worktree isolation, multi-database rollback, simultaneous create commands, missing-config reinitialization, moved worktrees, environment ignore rules, and JSON errors. Engine tests also cover WAL data, virtual-table restrictions, ownership tampering, and interrupted allocation recovery.
 
 Git hook tests preserve existing hook behavior and exercise paths with spaces and quotes. Environment tests cover comments, duplicate variables, multiline values, permissions, symlink rejection, and tracked files. Neon tests use a local HTTP server to check request payloads, parent selection, operation polling, cleanup, ownership, and credential redaction.
