@@ -295,6 +295,9 @@ pub fn install_hooks(root: &Path, executable: &Path) -> Result<()> {
             .set_permissions(std::fs::Permissions::from_mode(0o755))?;
     }
     temporary.as_file().sync_all()?;
+    // Close the writer before publishing an executable path. Linux rejects
+    // execution while any process still has the file open for writing.
+    let temporary = temporary.into_temp_path();
     let moved = !managed && existing.is_some();
     if moved {
         std::fs::rename(&hook, &backup)?;
@@ -336,6 +339,26 @@ mod tests {
     fn run(dir: &Path, args: &[&str]) {
         successful(git(dir, args).unwrap()).unwrap();
     }
+
+    #[cfg(unix)]
+    fn execute_hook(command: &mut Command) -> Output {
+        // A parallel test can fork while a hook is being written and briefly
+        // retain the writer until exec closes inherited descriptors. Retry only
+        // this pre-execution failure; still execute the hook's actual shebang.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            match command.output() {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                result => return result.expect("could not execute hook"),
+            }
+        }
+    }
+
     #[test]
     fn manual_directory() {
         let tmp = tempfile::tempdir().unwrap();
@@ -508,11 +531,11 @@ mod tests {
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         install_hooks(tmp.path(), &executable).unwrap();
         let hook = hook_path(tmp.path()).unwrap();
-        let result = Command::new(&hook)
-            .current_dir(tmp.path())
-            .args(["old", "new", "1"])
-            .output()
-            .unwrap();
+        let result = execute_hook(
+            Command::new(&hook)
+                .current_dir(tmp.path())
+                .args(["old", "new", "1"]),
+        );
         assert!(result.status.success());
         assert!(String::from_utf8_lossy(&result.stderr).contains("database sync failed"));
         assert_eq!(
@@ -525,12 +548,13 @@ mod tests {
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
         install_hooks(tmp.path(), &executable).unwrap();
         assert_eq!(
-            Command::new(hook)
-                .current_dir(tmp.path())
-                .args(["old", "new", "1"])
-                .status()
-                .unwrap()
-                .code(),
+            execute_hook(
+                Command::new(hook)
+                    .current_dir(tmp.path())
+                    .args(["old", "new", "1"]),
+            )
+            .status
+            .code(),
             Some(7)
         );
     }
