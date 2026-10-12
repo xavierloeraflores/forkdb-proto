@@ -52,7 +52,7 @@ async fn main() {
     let cli=match Cli::try_parse() {
         Ok(cli)=>cli,
         Err(error)=>{
-            if std::env::args().any(|a|a=="--json") && error.exit_code()!=0 {emit_error(true,2,"invalid_arguments",&error.to_string());}
+            if std::env::args().any(|a|a=="--json") && error.exit_code()!=0 {emit_error(true,2,"invalid_arguments","invalid command or arguments; run --help for usage");}
             error.exit()
         }
     };

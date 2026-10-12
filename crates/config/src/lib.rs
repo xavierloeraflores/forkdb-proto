@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use dbfork_model::{DatabaseConfig, Resource};
+use dbfork_model::{CloneRequest, DatabaseConfig, Resource};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{collections::{BTreeMap, BTreeSet}, fs::{self, File, OpenOptions}, io::Write, path::{Path, PathBuf}, time::{Duration, Instant}};
@@ -48,6 +48,7 @@ fn valid_key(k:&str)->bool { !k.is_empty() && k.bytes().enumerate().all(|(i,b)|b
 pub struct Environment {
     pub branch:String, pub parent:String, pub status:String,
     pub resources:Vec<Resource>, pub created_at:u64,
+    #[serde(default)] pub pending:Vec<CloneRequest>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct State {

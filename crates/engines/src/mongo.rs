@@ -2,10 +2,18 @@ use super::*;
 use std::{fs, io::Write};
 async fn shell(url: &str, script: &str, source: Option<&str>) -> Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
-    writeln!(file, "const db = connect(process.env.DBFORK_MONGO_URL);\n{script}")?;
+    writeln!(
+        file,
+        "const db = connect(process.env.DBFORK_MONGO_URL);\n{script}"
+    )?;
     let mut c = Command::new("mongosh");
-    c.args(["--nodb", "--quiet", "--file"]).arg(file.path()).env("DBFORK_MONGO_URL", url).stdin(Stdio::null());
-    if let Some(source) = source { c.env("DBFORK_MONGO_SOURCE", source); }
+    c.args(["--nodb", "--quiet", "--file"])
+        .arg(file.path())
+        .env("DBFORK_MONGO_URL", url)
+        .stdin(Stdio::null());
+    if let Some(source) = source {
+        c.env("DBFORK_MONGO_SOURCE", source);
+    }
     run(&mut c, "mongosh").await
 }
 fn config(url: &str) -> Result<tempfile::NamedTempFile> {
@@ -19,10 +27,16 @@ pub(crate) async fn create(request: &CloneRequest) -> Result<Resource> {
     let target = destination(request)?;
     let source = parse_url(&request.source.connection_url)?;
     let source_name = database_name(&source)?;
-    ensure!(source_name != request.target_id, "destination database name must differ from source");
-    ensure!(!source_name.contains(['*', '$']), "unsupported MongoDB database name");
+    ensure!(
+        source_name != request.target_id,
+        "destination database name must differ from source"
+    );
+    ensure!(
+        !source_name.contains(['*', '$']),
+        "unsupported MongoDB database name"
+    );
     let r = resource(request, target.to_string());
-    shell(&r.connection_url, &format!("if (db.getCollectionNames().length) throw new Error('destination already exists'); db._dbfork_owner.insertOne({{_id:'owner', id:{}}});", serde_json::to_string(&r.id)?), None).await?;
+    shell(&r.connection_url, &format!("if (db.getCollectionNames().length) throw new Error('destination already exists'); db.getCollection('_dbfork_owner').insertOne({{_id:'owner', id:{}}});", serde_json::to_string(&r.id)?), None).await?;
     let result: Result<()> = async {
         if request.strategy == Strategy::Full {
             let archive = tempfile::NamedTempFile::new()?;
@@ -55,16 +69,48 @@ for (const c of collections.filter(c => c.type === 'view')) db.createCollection(
         Ok(())
     }.await;
     if let Err(error) = result {
-        if delete(&r).await.is_err() { bail!("{error}; cleanup failed for MongoDB database {}", r.id); }
+        if delete(&r).await.is_err() {
+            bail!("{error}; cleanup failed for MongoDB database {}", r.id);
+        }
         return Err(error);
     }
     Ok(r)
 }
 fn ownership_script(r: &Resource) -> Result<String> {
-    ensure!(database_name(&parse_url(&r.connection_url)?)? == r.id, "MongoDB database does not match owned resource");
-    Ok(format!("const owner = db._dbfork_owner.findOne({{_id:'owner'}}); if (!owner || owner.id !== {}) throw new Error('ownership mismatch');", serde_json::to_string(&r.id)?))
+    ensure!(
+        database_name(&parse_url(&r.connection_url)?)? == r.id,
+        "MongoDB database does not match owned resource"
+    );
+    Ok(format!("const owner = db.getCollection('_dbfork_owner').findOne({{_id:'owner'}}); if (!owner || owner.id !== {}) throw new Error('ownership mismatch');", serde_json::to_string(&r.id)?))
 }
-pub(crate) async fn validate(r: &Resource) -> Result<()> { shell(&r.connection_url, &ownership_script(r)?, None).await }
+pub(crate) async fn validate(r: &Resource) -> Result<()> {
+    shell(&r.connection_url, &ownership_script(r)?, None).await
+}
 pub(crate) async fn delete(r: &Resource) -> Result<()> {
-    shell(&r.connection_url, &format!("{}\ndb.dropDatabase();", ownership_script(r)?), None).await
+    shell(
+        &r.connection_url,
+        &format!(
+            "if (db.getCollectionNames().length) {{ {}\ndb.dropDatabase(); }}",
+            ownership_script(r)?
+        ),
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn recover(request: &CloneRequest) -> Result<Option<Resource>> {
+    let r = resource(request, destination(request)?.to_string());
+    let mut c = Command::new("mongosh");
+    c.args(["--nodb","--quiet","--eval","const db=connect(process.env.DBFORK_MONGO_URL); print(JSON.stringify(db.getCollectionNames()));"])
+        .env("DBFORK_MONGO_URL",&r.connection_url).stdin(Stdio::null());
+    let output = run_output(&mut c, "MongoDB recovery inspection").await?;
+    let collections: Vec<String> =
+        serde_json::from_slice(&output).context("invalid MongoDB recovery response")?;
+    if collections.is_empty() {
+        return Ok(None);
+    }
+    validate(&r)
+        .await
+        .context("pending MongoDB database has unknown ownership; refusing cleanup")?;
+    Ok(Some(r))
 }

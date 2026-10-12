@@ -5,11 +5,9 @@ use std::{collections::BTreeMap, path::PathBuf};
 #[serde(rename_all = "snake_case")]
 pub enum Engine { Postgres, Mysql, Sqlite, Mongodb, Redis }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum Strategy { Full, SchemaOnly, Seeded, Template, Native, File, Instance, Snapshot }
-
-impl Default for Strategy { fn default() -> Self { Self::Full } }
+pub enum Strategy { #[default] Full, SchemaOnly, Seeded, Template, Native, File, Instance, Snapshot }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,7 +34,7 @@ pub struct Resource {
     #[serde(default)] pub metadata: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloneRequest {
     pub config: DatabaseConfig,
     pub source: Resource,

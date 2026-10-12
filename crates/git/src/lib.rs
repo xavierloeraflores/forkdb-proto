@@ -59,8 +59,14 @@ fn path(data: Vec<u8>) -> Result<PathBuf> {
 
 pub fn discover(dir: &Path) -> Result<Context> {
     let manual = || -> Result<Context> {
+        let directory = dir.canonicalize()?;
+        let root = directory
+            .ancestors()
+            .find(|path| path.join(".dbfork.toml").is_file())
+            .unwrap_or(&directory)
+            .to_owned();
         Ok(Context {
-            root: dir.canonicalize()?,
+            root,
             common_dir: None,
             branch: None,
         })
@@ -150,6 +156,46 @@ pub fn branches(root: &Path) -> Result<Vec<String>> {
         .lines()
         .map(str::to_owned)
         .collect())
+}
+
+/// Prefer the remote's declared default, then conventional local source branches.
+pub fn default_branch(root: &Path) -> Result<String> {
+    let context = discover(root)?;
+    if context.common_dir.is_none() {
+        return Ok("main".into());
+    }
+    let remote = git(
+        root,
+        &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+    )?;
+    if remote.status.success() {
+        let reference = String::from_utf8(one_line(remote.stdout))
+            .context("remote branch name is not UTF-8")?;
+        if let Some(branch) = reference.strip_prefix("refs/remotes/origin/") {
+            if !branch.is_empty()
+                && git(
+                    root,
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        "refs/remotes/origin/HEAD^{commit}",
+                    ],
+                )?
+                .status
+                .success()
+            {
+                return Ok(branch.to_owned());
+            }
+        }
+    }
+    let local = branches(root)?;
+    for name in ["main", "master"] {
+        if local.iter().any(|branch| branch == name) {
+            return Ok(name.into());
+        }
+    }
+    Ok(context.branch.unwrap_or_else(|| "main".into()))
 }
 
 const HOOK_MARKER: &str = "#!/bin/sh\n# dbfork-proto managed post-checkout hook v1\n";
@@ -278,6 +324,60 @@ mod tests {
         assert_eq!(context.root, tmp.path().canonicalize().unwrap());
         assert!(context.common_dir.is_none());
         assert!(worktrees(tmp.path()).unwrap().is_empty());
+        assert_eq!(default_branch(tmp.path()).unwrap(), "main");
+        std::fs::write(tmp.path().join(".dbfork.toml"), "").unwrap();
+        let nested = tmp.path().join("nested").join("deeper");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(
+            discover(&nested).unwrap().root,
+            tmp.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn default_branch_prefers_resolved_remote_then_main_master_and_current() {
+        let tmp = tempfile::tempdir().unwrap();
+        run(tmp.path(), &["init", "-b", "master"]);
+        assert_eq!(default_branch(tmp.path()).unwrap(), "master");
+        run(
+            tmp.path(),
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        );
+        run(tmp.path(), &["checkout", "-b", "feature"]);
+        assert_eq!(default_branch(tmp.path()).unwrap(), "master");
+        run(tmp.path(), &["branch", "main"]);
+        assert_eq!(default_branch(tmp.path()).unwrap(), "main");
+        run(
+            tmp.path(),
+            &["update-ref", "refs/remotes/origin/trunk", "HEAD"],
+        );
+        run(
+            tmp.path(),
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/trunk",
+            ],
+        );
+        assert_eq!(default_branch(tmp.path()).unwrap(), "trunk");
+        run(
+            tmp.path(),
+            &["update-ref", "-d", "refs/remotes/origin/trunk"],
+        );
+        assert_eq!(default_branch(tmp.path()).unwrap(), "main");
+        run(tmp.path(), &["branch", "-D", "main", "master"]);
+        assert_eq!(default_branch(tmp.path()).unwrap(), "feature");
+        run(tmp.path(), &["checkout", "--detach"]);
+        assert_eq!(default_branch(tmp.path()).unwrap(), "main");
     }
     #[test]
     fn branches_worktrees_and_detached_heads() {

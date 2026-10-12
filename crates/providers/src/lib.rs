@@ -5,6 +5,18 @@ use dbfork_model::{Capabilities, CloneRequest, Engine, Resource, Strategy};
 mod docker;
 mod neon;
 
+/// A provisioning request may still complete remotely. Keep its durable intent.
+#[derive(Debug)]
+pub struct OutcomeUnknown {
+    pub resource_hint: String,
+}
+impl std::fmt::Display for OutcomeUnknown {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "provisioning outcome is unknown for {}; retain the pending intent and run delete to recover it before retrying", self.resource_hint)
+    }
+}
+impl std::error::Error for OutcomeUnknown {}
+
 pub fn capabilities(provider: &str) -> Result<Capabilities> {
     use Engine::*;
     use Strategy::*;
@@ -66,6 +78,25 @@ pub async fn validate(resource: &Resource) -> Result<()> {
         ("docker", Strategy::Instance) => docker::validate(resource).await,
         ("neon", Strategy::Native | Strategy::Snapshot) => neon::validate(resource).await,
         _ => bail!("provider cannot validate this resource strategy"),
+    }
+}
+
+/// Recover the remote identity of an interrupted provisioning request for cleanup.
+/// Returned resources may not contain a working connection URL.
+pub async fn recover(request: &CloneRequest) -> Result<Option<Resource>> {
+    anyhow::ensure!(
+        request.target_id.starts_with("dbf_")
+            && request.target_id.len() <= 63
+            && request
+                .target_id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+        "invalid pending resource identifier"
+    );
+    match (request.config.provider.as_str(), request.strategy) {
+        ("docker", Strategy::Instance) => docker::recover(request).await,
+        ("neon", Strategy::Native | Strategy::Snapshot) => neon::recover(request).await,
+        _ => bail!("provider cannot recover this resource strategy"),
     }
 }
 

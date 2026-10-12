@@ -10,7 +10,20 @@ async fn docker(args: &[&str]) -> Result<Output> {
     command.args(args).kill_on_drop(true);
     tokio::time::timeout(Duration::from_secs(300), command.output())
         .await
-        .context("Docker command timed out")?
+        .map_err(|_| {
+            if args.first() == Some(&"run") {
+                anyhow::Error::new(crate::OutcomeUnknown {
+                    resource_hint: args
+                        .windows(2)
+                        .find(|a| a[0] == "--name")
+                        .map(|a| a[1])
+                        .unwrap_or("Docker container")
+                        .into(),
+                })
+            } else {
+                anyhow::anyhow!("Docker command timed out")
+            }
+        })?
         .context("could not run docker; install Docker and start its daemon")
 }
 
@@ -18,13 +31,15 @@ fn engine_settings(engine: Engine) -> Result<(&'static str, u16, &'static str)> 
     Ok(match engine {
         Engine::Postgres => ("postgres:17", 5432, "postgres"),
         Engine::Mysql => ("mysql:8.4", 3306, "mysql"),
-        Engine::Mongodb => ("mongo:8", 27017, "mongodb"),
+        Engine::Mongodb => ("mongo:7", 27017, "mongodb"),
         Engine::Redis => ("redis:7-alpine", 6379, "redis"),
         Engine::Sqlite => bail!("SQLite uses file cloning, not Docker instances"),
     })
 }
 
 pub async fn create(request: &CloneRequest) -> Result<Resource> {
+    ensure_local_daemon().await?;
+    ensure!(recover(request).await?.is_none(), "a Docker container already exists for this provisioning intent; recover it before retrying");
     let (default_image, inner_port, scheme) = engine_settings(request.config.engine)?;
     let mode = match request
         .config
@@ -60,6 +75,7 @@ pub async fn create(request: &CloneRequest) -> Result<Resource> {
     env_file.flush()?;
     let owner_label = format!("dbfork-proto.owner={token}");
     let db_label = format!("dbfork-proto.database={}", request.config.name);
+    let intent_label = format!("dbfork-proto.intent={}", request.target_id);
     let publish = format!("127.0.0.1::{inner_port}");
     let env_path = env_file
         .path()
@@ -84,6 +100,8 @@ pub async fn create(request: &CloneRequest) -> Result<Resource> {
         &owner_label,
         "--label",
         &db_label,
+        "--label",
+        &intent_label,
         "--publish",
         &publish,
         "--env-file",
@@ -166,12 +184,110 @@ pub async fn create(request: &CloneRequest) -> Result<Resource> {
     match result {
         Ok(resource) => Ok(resource),
         Err(error) => {
+            if error.downcast_ref::<crate::OutcomeUnknown>().is_some() {
+                return Err(error);
+            }
             if let Err(cleanup) = delete(&shell).await {
                 bail!("{error}; rollback failed for container {name}: {cleanup}");
             }
             Err(error)
         }
     }
+}
+
+pub async fn recover(request: &CloneRequest) -> Result<Option<Resource>> {
+    let filter = format!("label=dbfork-proto.intent={}", request.target_id);
+    let found = docker(&[
+        "ps",
+        "--all",
+        "--no-trunc",
+        "--filter",
+        &filter,
+        "--format",
+        "{{.ID}}",
+    ])
+    .await?;
+    ensure!(
+        found.status.success(),
+        "Docker could not search for an interrupted provisioning intent"
+    );
+    let text = String::from_utf8(found.stdout)?;
+    let ids = text.lines().filter(|s| !s.is_empty()).collect::<Vec<_>>();
+    ensure!(
+        ids.len() <= 1,
+        "multiple containers match the provisioning intent; manual recovery is required"
+    );
+    let Some(id) = ids.first() else {
+        return Ok(None);
+    };
+    ensure!(
+        id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+        "Docker returned an invalid recovery identity"
+    );
+    let inspected = docker(&[
+        "inspect",
+        "--type",
+        "container",
+        "--format",
+        "{{json .Config.Labels}}",
+        id,
+    ])
+    .await?;
+    ensure!(
+        inspected.status.success(),
+        "Docker recovery could not inspect the tracked container"
+    );
+    let labels: Value = serde_json::from_slice(&inspected.stdout)?;
+    let owner = labels
+        .get("dbfork-proto.owner")
+        .and_then(Value::as_str)
+        .context("recovered Docker container has no ownership label")?;
+    ensure!(
+        owner.len() == 32 && owner.bytes().all(|b| b.is_ascii_hexdigit()),
+        "invalid recovered Docker ownership token"
+    );
+    ensure!(
+        labels.get("dbfork-proto.intent").and_then(Value::as_str) == Some(&request.target_id),
+        "Docker recovery intent mismatch"
+    );
+    ensure!(
+        labels.get("dbfork-proto.database").and_then(Value::as_str) == Some(&request.config.name),
+        "Docker recovery database mismatch"
+    );
+    Ok(Some(Resource {
+        database: request.config.name.clone(),
+        engine: request.config.engine,
+        provider: "docker".into(),
+        id: request.target_id.clone(),
+        connection_url: String::new(),
+        strategy: Strategy::Instance,
+        metadata: BTreeMap::from([
+            ("docker_container".into(), (*id).into()),
+            ("docker_owner".into(), owner.into()),
+        ]),
+    }))
+}
+
+async fn ensure_local_daemon() -> Result<()> {
+    let host = if let Ok(host) = std::env::var("DOCKER_HOST") {
+        host
+    } else {
+        let output = docker(&[
+            "context",
+            "inspect",
+            "--format",
+            "{{json .Endpoints.docker.Host}}",
+        ])
+        .await?;
+        ensure!(
+            output.status.success(),
+            "cannot inspect the active Docker context"
+        );
+        serde_json::from_slice::<String>(&output.stdout)
+            .context("invalid Docker context endpoint")?
+    };
+    ensure!(host.starts_with("unix://") || host.starts_with("npipe://"), "Docker instance provisioning requires a local Docker context using a Unix socket or Windows named pipe");
+    Ok(())
 }
 
 async fn wait_ready(container: &str, engine: Engine) -> Result<()> {
@@ -191,6 +307,8 @@ async fn wait_ready(container: &str, engine: Engine) -> Result<()> {
             {
                 return Ok(());
             }
+            let state = docker(&["inspect", "--format", "{{.State.Running}}", container]).await?;
+            ensure!(state.status.success() && state.stdout == b"true\n", "database container exited before becoming ready; check image and host compatibility");
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     };

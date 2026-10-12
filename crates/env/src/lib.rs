@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{Read, Write},
     path::{Component, Path},
     process::Command,
@@ -223,7 +223,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     temporary.as_file().sync_all()?;
     temporary.persist(path).map_err(|error| error.error)?;
     #[cfg(unix)]
-    File::open(parent)?.sync_all()?;
+    fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -316,6 +316,19 @@ pub fn ensure_ignored(root: &Path, relative: &Path) -> Result<()> {
         text.push('\n');
         atomic_write(&destination, text.as_bytes())?;
     }
+    if in_git {
+        // A repository .gitignore negation has higher precedence than
+        // info/exclude. Verify protection before the caller writes secrets.
+        let ignored = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["check-ignore", "--no-index", "--quiet", "--"])
+            .arg(relative)
+            .output()?;
+        if !ignored.status.success() {
+            bail!("Git ignore rules do not protect {}; remove overriding ignore negations before writing credentials", relative.display());
+        }
+    }
     Ok(())
 }
 
@@ -403,6 +416,23 @@ mod tests {
             .status
             .success());
         assert!(ensure_ignored(temp.path(), Path::new("tracked")).is_err());
+    }
+    #[test]
+    fn git_ignore_negation_cannot_expose_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(Command::new("git")
+            .arg("init")
+            .arg(temp.path())
+            .output()
+            .unwrap()
+            .status
+            .success());
+        fs::write(temp.path().join(".gitignore"), "!.env\n").unwrap();
+        assert!(ensure_ignored(temp.path(), Path::new(".env")).is_err());
+        // The same protection check must run if the exclude rule already exists.
+        assert!(ensure_ignored(temp.path(), Path::new(".env")).is_err());
+        fs::write(temp.path().join(".gitignore"), "").unwrap();
+        ensure_ignored(temp.path(), Path::new(".env")).unwrap();
     }
     #[cfg(unix)]
     #[test]

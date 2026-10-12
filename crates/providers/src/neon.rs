@@ -47,24 +47,39 @@ impl Neon {
             req = req.json(body);
         }
         // Never print response bodies or request URLs; both can contain credentials.
-        let response = req.send().await.map_err(|_| anyhow::anyhow!("Neon API transport failed; a mutating request may have completed remotely, inspect the project before retrying"))?;
+        let uncertain = || {
+            anyhow::Error::new(crate::OutcomeUnknown {
+                resource_hint: format!("Neon {path}"),
+            })
+        };
+        let response = req.send().await.map_err(|_| {
+            if method == Method::POST {
+                uncertain()
+            } else {
+                anyhow::anyhow!("Neon API transport failed")
+            }
+        })?;
         if response.status() == StatusCode::NOT_FOUND && method == Method::GET {
             return Ok(None);
         }
         if response.status() == StatusCode::NO_CONTENT {
             return Ok(None);
         }
+        if method == Method::POST && response.status().is_server_error() {
+            return Err(uncertain());
+        }
         ensure!(
             response.status().is_success(),
             "Neon API returned HTTP {}",
             response.status().as_u16()
         );
-        Ok(Some(
-            response
-                .json()
-                .await
-                .context("Neon API returned an invalid JSON response")?,
-        ))
+        Ok(Some(response.json().await.map_err(|_| {
+            if method == Method::POST {
+                uncertain()
+            } else {
+                anyhow::anyhow!("Neon API returned an invalid JSON response")
+            }
+        })?))
     }
 
     async fn branch(&self, project: &str, branch: &str) -> Result<Option<Value>> {
@@ -233,7 +248,7 @@ fn same_database(left: &str, right: &str) -> Result<bool> {
     let b = Url::parse(right).context("invalid Neon PostgreSQL URL")?;
     let host = |url: &Url| url.host_str().unwrap_or_default().replace("-pooler.", ".");
     Ok(host(&a) == host(&b)
-        && a.port_or_known_default() == b.port_or_known_default()
+        && a.port().unwrap_or(5432) == b.port().unwrap_or(5432)
         && a.path() == b.path()
         && a.username() == b.username())
 }
@@ -253,6 +268,10 @@ async fn create_with_api(request: &CloneRequest, api: &Neon) -> Result<Resource>
     ensure!(
         request.config.engine == Engine::Postgres,
         "Neon supports PostgreSQL"
+    );
+    ensure!(
+        recover_with_api(request, api).await?.is_none(),
+        "a Neon branch already exists for this provisioning intent; recover it before retrying"
     );
     let options = &request.config.options;
     let project = options
@@ -298,18 +317,21 @@ async fn create_with_api(request: &CloneRequest, api: &Neon) -> Result<Resource>
         same_database(&request.source.connection_url, &parent_uri)?,
         "configured Neon parent does not match the source database endpoint, role, or database"
     );
-    let name = format!("dbfork-{}", uuid::Uuid::new_v4().simple());
+    let name = format!("dbfork-{}", request.target_id);
     let body =
         json!({"branch":{"name":name,"parent_id":parent},"endpoints":[{"type":"read_write"}]});
     let response = api.request(Method::POST, &format!("/projects/{project}/branches"), Some(&body), &[]).await
-        .with_context(|| format!("creating Neon branch {name}; if outcome is unknown, inspect this branch name before retrying"))?.context("Neon create response was empty")?;
+        .with_context(|| format!("creating Neon branch {name}; if outcome is unknown, inspect this branch name before retrying"))?
+        .ok_or_else(||crate::OutcomeUnknown {resource_hint:name.clone()})?;
     let id = response
         .pointer("/branch/id")
         .and_then(Value::as_str)
-        .with_context(|| {
-            format!("Neon response has no branch ID; inspect branch {name} before retrying")
+        .ok_or_else(|| crate::OutcomeUnknown {
+            resource_hint: name.clone(),
         })?;
-    identifier(id)?;
+    identifier(id).map_err(|_| crate::OutcomeUnknown {
+        resource_hint: name.clone(),
+    })?;
     ensure!(
         id != parent,
         "Neon API returned the source branch instead of a new branch"
@@ -348,6 +370,107 @@ async fn create_with_api(request: &CloneRequest, api: &Neon) -> Result<Resource>
         return Err(error);
     }
     Ok(resource)
+}
+
+pub async fn recover(request: &CloneRequest) -> Result<Option<Resource>> {
+    let key_env = request
+        .config
+        .options
+        .get("api_key_env")
+        .map(String::as_str)
+        .unwrap_or("NEON_API_KEY");
+    let api = Neon::from_env(key_env)?;
+    recover_with_api(request, &api).await
+}
+
+async fn recover_with_api(request: &CloneRequest, api: &Neon) -> Result<Option<Resource>> {
+    let options = &request.config.options;
+    let project = options
+        .get("project_id")
+        .context("Neon recovery requires options.project_id")?;
+    let parent = request
+        .source
+        .metadata
+        .get("neon_branch_id")
+        .or_else(|| options.get("parent_branch_id"))
+        .context("Neon recovery requires the source branch ID")?;
+    identifier(project)?;
+    identifier(parent)?;
+    let name = format!("dbfork-{}", request.target_id);
+    let mut cursor = String::new();
+    let mut seen_cursors = std::collections::BTreeSet::new();
+    let mut found = None;
+    loop {
+        let mut query = vec![("search", name.as_str()), ("limit", "100")];
+        if !cursor.is_empty() {
+            query.push(("cursor", cursor.as_str()));
+        }
+        let response = api
+            .request(
+                Method::GET,
+                &format!("/projects/{project}/branches"),
+                None,
+                &query,
+            )
+            .await?
+            .context("Neon recovery could not list project branches")?;
+        let branches = response
+            .get("branches")
+            .and_then(Value::as_array)
+            .context("Neon recovery returned no branch list")?;
+        for branch in branches {
+            if branch.get("name").and_then(Value::as_str) != Some(&name) {
+                continue;
+            }
+            ensure!(
+                found.is_none(),
+                "multiple Neon branches match this intent; manual recovery is required"
+            );
+            let id = branch
+                .get("id")
+                .and_then(Value::as_str)
+                .context("Neon recovery branch has no ID")?;
+            identifier(id)?;
+            check_branch(branch, id, &name)?;
+            ensure!(
+                branch.get("parent_id").and_then(Value::as_str) == Some(parent),
+                "Neon recovery branch parent does not match the pending request"
+            );
+            ensure!(id != parent, "Neon recovery refused the source branch");
+            found = Some(Resource {
+                database: request.config.name.clone(),
+                engine: Engine::Postgres,
+                provider: "neon".into(),
+                id: request.target_id.clone(),
+                connection_url: String::new(),
+                strategy: request.strategy,
+                metadata: BTreeMap::from([
+                    ("neon_project_id".into(), project.clone()),
+                    ("neon_branch_id".into(), id.into()),
+                    ("neon_branch_name".into(), name.clone()),
+                    ("neon_parent_id".into(), parent.clone()),
+                    (
+                        "neon_api_key_env".into(),
+                        options
+                            .get("api_key_env")
+                            .cloned()
+                            .unwrap_or_else(|| "NEON_API_KEY".into()),
+                    ),
+                ]),
+            });
+        }
+        match response.pointer("/pagination/next").and_then(Value::as_str) {
+            Some(next) if !next.is_empty() => {
+                ensure!(
+                    seen_cursors.insert(next.to_owned()),
+                    "Neon recovery pagination cursor repeated"
+                );
+                cursor = next.into();
+            }
+            _ => break,
+        }
+    }
+    Ok(found)
 }
 
 async fn check_connection(uri: &str) -> Result<()> {
@@ -462,6 +585,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_success_response_keeps_unknown_outcome_typed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            let count = socket.read(&mut bytes).await.unwrap();
+            assert!(count > 0);
+            socket.write_all(b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{").await.unwrap();
+        });
+        let api = Neon {
+            client: Client::new(),
+            base: format!("http://{address}"),
+            key: "secret-key".into(),
+        };
+        let error = api
+            .request(
+                Method::POST,
+                "/projects/test/branches",
+                Some(&json!({})),
+                &[],
+            )
+            .await
+            .context("creating a branch")
+            .unwrap_err();
+        assert!(error.downcast_ref::<crate::OutcomeUnknown>().is_some());
+        assert!(!format!("{error:#}").contains("secret-key"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_uses_exact_name_and_follows_pagination() {
+        use dbfork_model::{DatabaseConfig, Strategy};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for page in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let n = socket.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..n]);
+                assert!(request.starts_with(
+                    "GET /projects/project-test/branches?search=dbfork-dbf_test&limit=100"
+                ));
+                let body = if page == 0 {
+                    json!({"branches":[{"name":"dbfork-dbf_test_different"}],"pagination":{"next":"page-two"}})
+                } else {
+                    assert!(request.contains("cursor=page-two"));
+                    json!({"branches":[{"id":"br-recovered","name":"dbfork-dbf_test","parent_id":"br-parent","default":false}]})
+                }.to_string();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
+            }
+        });
+        let request = CloneRequest {
+            config: DatabaseConfig {
+                name: "primary".into(),
+                engine: Engine::Postgres,
+                provider: "neon".into(),
+                connection_env: "DATABASE_URL".into(),
+                source_env: None,
+                strategy: Strategy::Native,
+                seed: vec![],
+                options: BTreeMap::from([
+                    ("project_id".into(), "project-test".into()),
+                    ("parent_branch_id".into(), "br-parent".into()),
+                ]),
+            },
+            source: Resource {
+                database: "primary".into(),
+                engine: Engine::Postgres,
+                provider: "neon".into(),
+                id: "source".into(),
+                connection_url: String::new(),
+                strategy: Strategy::Native,
+                metadata: BTreeMap::new(),
+            },
+            target_id: "dbf_test".into(),
+            data_dir: ".".into(),
+            project_dir: ".".into(),
+            strategy: Strategy::Native,
+        };
+        let api = Neon {
+            client: Client::new(),
+            base: format!("http://{address}"),
+            key: "test-key".into(),
+        };
+        let resource = recover_with_api(&request, &api).await.unwrap().unwrap();
+        assert_eq!(resource.id, "dbf_test");
+        assert_eq!(
+            resource.metadata.get("neon_branch_id").unwrap(),
+            "br-recovered"
+        );
+        assert_eq!(
+            resource.metadata.get("neon_parent_id").unwrap(),
+            "br-parent"
+        );
+        assert!(resource.connection_url.is_empty());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn create_uses_selected_parent_and_rolls_back_failed_operations() {
         use dbfork_model::{DatabaseConfig, Strategy};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -469,7 +695,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let mut branch_name = String::new();
-            for step in 0..5 {
+            for step in 0..6 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 loop {
@@ -493,11 +719,17 @@ mod tests {
                 let response = match step {
                     0 => {
                         assert!(request.starts_with(
+                            "GET /projects/project-test/branches?search=dbfork-dbf_test&limit=100"
+                        ));
+                        json!({"branches":[]})
+                    }
+                    1 => {
+                        assert!(request.starts_with(
                             "GET /projects/project-test/connection_uri?branch_id=br-feature&"
                         ));
                         json!({"uri":"postgres://user:secret@ep-parent.example/app"})
                     }
-                    1 => {
+                    2 => {
                         assert!(request.starts_with("POST /projects/project-test/branches"));
                         let body: Value =
                             serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1)
@@ -512,17 +744,17 @@ mod tests {
                             .into();
                         json!({"branch":{"id":"br-new"},"operations":[{"id":"op-test"}]})
                     }
-                    2 => {
+                    3 => {
                         assert!(
                             request.starts_with("GET /projects/project-test/operations/op-test")
                         );
                         json!({"operation":{"status":"failed"}})
                     }
-                    3 => {
+                    4 => {
                         assert!(request.starts_with("GET /projects/project-test/branches/br-new"));
                         json!({"branch":{"id":"br-new","name":branch_name,"parent_id":"br-feature","default":false}})
                     }
-                    4 => {
+                    5 => {
                         assert!(
                             request.starts_with("DELETE /projects/project-test/branches/br-new")
                         );
