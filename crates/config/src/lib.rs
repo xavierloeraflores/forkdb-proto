@@ -171,6 +171,17 @@ pub fn private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 pub struct Lock(File);
+fn lock_is_contended(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    // LockFileEx reports ERROR_LOCK_VIOLATION instead of WouldBlock on Windows.
+    #[cfg(windows)]
+    if error.raw_os_error() == Some(33) {
+        return true;
+    }
+    false
+}
 impl Lock {
     pub fn acquire(dir: &Path) -> Result<Self> {
         private_dir(dir)?;
@@ -186,10 +197,7 @@ impl Lock {
         loop {
             match file.try_lock_exclusive() {
                 Ok(()) => return Ok(Self(file)),
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        && start.elapsed() < Duration::from_secs(30) =>
-                {
+                Err(e) if lock_is_contended(&e) && start.elapsed() < Duration::from_secs(30) => {
                     std::thread::sleep(Duration::from_millis(50))
                 }
                 Err(_) => bail!(
@@ -208,6 +216,12 @@ impl Drop for Lock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn windows_lock_violation_is_retryable() {
+        assert!(lock_is_contended(&std::io::Error::from_raw_os_error(33)));
+        assert!(!lock_is_contended(&std::io::Error::from_raw_os_error(5)));
+    }
     #[test]
     fn rejects_traversal_and_duplicates() {
         let mut c:Config=toml::from_str("[project]\nname='test'\n[[databases]]\nname='db'\nengine='sqlite'\nprovider='local'\nconnection_env='DATABASE_URL'\n").unwrap();
