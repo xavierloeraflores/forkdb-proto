@@ -20,6 +20,10 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --locked
       - run: cargo build --release --locked
+      - name: Exercise the Windows release binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./tests/integration/windows.ps1
   databases:
     runs-on: ubuntu-latest
     steps:
