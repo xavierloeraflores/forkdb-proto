@@ -37,6 +37,8 @@ dbfork-proto create feat/child --from feat/auth --json
 
 The role needs permission to create databases. Install `pg_dump` and `pg_restore` compatible with the server. Use a development source suitable for copying. Managed services may require a direct connection instead of a transaction pooler.
 
+For a sample application, see [forkdb-proto-test-case](https://github.com/xavierloeraflores/forkdb-proto-test-case), a Next.js task CRUD app using Prisma and PostgreSQL. Its 15 example tasks and documented database baseline provide a starting point for trying separate database forks in Git worktrees.
+
 ## Configuration
 
 Commit `.dbfork.toml`. Keep connection URLs and API keys outside it.
