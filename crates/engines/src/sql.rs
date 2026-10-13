@@ -33,6 +33,17 @@ fn quoted(name: &str, engine: Engine) -> Result<String> {
 }
 fn pg_command(program: &str, url: &str) -> Result<Command> {
     let mut u = parse_url(url)?;
+    // Prisma's schema selects an application search path, not a libpq option.
+    // Keep the full database clone while preserving supported connection options.
+    let connection_options: Vec<(String, String)> = u
+        .query_pairs()
+        .filter(|(key, _)| key != "schema")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    u.set_query(None);
+    if !connection_options.is_empty() {
+        u.query_pairs_mut().extend_pairs(connection_options);
+    }
     let password = u.password().map(|p| {
         percent_encoding::percent_decode_str(p)
             .decode_utf8_lossy()
@@ -253,4 +264,44 @@ async fn exists(r: &Resource) -> Result<bool> {
             > 0
     };
     Ok(exists)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn postgres_tools_accept_prisma_urls_without_losing_libpq_options() {
+        for program in ["pg_dump", "pg_restore"] {
+            let command = pg_command(
+                program,
+                "postgresql://demo:p%40ss@localhost/tasks?schema=public&sslmode=require&application_name=fork%20demo",
+            )
+            .unwrap();
+            let command = command.as_std();
+            let args: Vec<_> = command.get_args().collect();
+            assert_eq!(args[0], "--dbname");
+            let url = url::Url::parse(args[1].to_str().unwrap()).unwrap();
+            assert_eq!(url.path(), "/tasks");
+            assert_eq!(url.password(), None);
+            assert_eq!(
+                url.query_pairs().collect::<Vec<_>>(),
+                vec![
+                    ("sslmode".into(), "require".into()),
+                    ("application_name".into(), "fork demo".into()),
+                ]
+            );
+            assert!(command.get_envs().any(|(key, value)| {
+                key == "PGPASSWORD" && value == Some(std::ffi::OsStr::new("p@ss"))
+            }));
+        }
+    }
+
+    #[test]
+    fn postgres_tools_omit_empty_query_after_removing_schema() {
+        let command =
+            pg_command("pg_dump", "postgresql://demo@localhost/tasks?schema=public").unwrap();
+        let args: Vec<_> = command.as_std().get_args().collect();
+        assert_eq!(args[1], "postgresql://demo@localhost/tasks");
+    }
 }
