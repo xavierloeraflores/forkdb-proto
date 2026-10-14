@@ -108,6 +108,16 @@ Worktrees share state and an exclusive operation lock in Git's common directory,
 
 ## Agent use and cleanup
 
+Repository skills live in [`.agents/skills`](.agents/skills):
+
+- [Worktree setup](.agents/skills/forkdb-worktree-setup/SKILL.md) provisions and verifies databases before an agent runs the app in a new worktree, including detached checkouts.
+- [Worktree cleanup](.agents/skills/forkdb-worktree-cleanup/SKILL.md) records database bindings before removing worktrees, then deletes their unused environments.
+- [Diagnostics](.agents/skills/forkdb-diagnose/SKILL.md) handles failed provisioning, unhealthy connections, and refused deletion.
+
+All three allow implicit invocation. To use them in an application repository, copy the desired skill folders into that repository's `.agents/skills/` directory, or install them in your agent's user skill directory. They can also be invoked explicitly as `$forkdb-worktree-setup`, `$forkdb-worktree-cleanup`, and `$forkdb-diagnose`.
+
+Skills guide an active agent; they do not register Git event handlers. Use `hooks install` for automatic checkout sync. Worktree removal still needs explicit database cleanup, which the cleanup skill instructs the agent to perform. See the [Codex skill discovery documentation](https://learn.chatgpt.com/docs/build-skills).
+
 ```sh
 dbfork-proto --json create feat/agent --no-switch
 dbfork-proto --json list
